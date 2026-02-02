@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import Announcement from "./components/Announcement";
+import FundChart from './components/FundChart';
 
 function PlusIcon(props) {
   return (
@@ -96,6 +96,115 @@ function Stat({ label, value, delta }) {
   );
 }
 
+const TREND_KEY_PREFIX = 'fundTrendData:';
+const TREND_MAX_POINTS = 300;
+const LISTS_KEY = 'fundLists';
+const LIST_MAP_KEY = 'fundListMap';
+const DEFAULT_LISTS = [
+  { id: 'watch', name: '自选' },
+  { id: 'holding', name: '持有' }
+];
+
+function parseGzTime(gztime) {
+  if (!gztime || typeof gztime !== 'string') return null;
+  const parts = gztime.trim().split(' ');
+  if (parts.length < 2) return null;
+  const date = parts[0];
+  const time = parts[1].slice(0, 5);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+  if (!/^\d{2}:\d{2}$/.test(time)) return null;
+  return { date, time };
+}
+
+function toMinutes(timeStr) {
+  if (!timeStr) return null;
+  const [hStr, mStr] = timeStr.split(':');
+  const h = Number(hStr);
+  const m = Number(mStr);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+  return h * 60 + m;
+}
+
+function isTradingTime(timeStr) {
+  const minutes = toMinutes(timeStr);
+  if (minutes === null) return false;
+  const morningStart = 9 * 60 + 30;
+  const morningEnd = 11 * 60 + 30;
+  const afternoonStart = 13 * 60;
+  const afternoonEnd = 15 * 60;
+  return (minutes >= morningStart && minutes <= morningEnd) ||
+    (minutes >= afternoonStart && minutes <= afternoonEnd);
+}
+
+function saveTrendPoint(code, pct, gztime) {
+  if (typeof window === 'undefined' || !code) return;
+  const pctNum = Number(pct);
+  if (!Number.isFinite(pctNum)) return;
+
+  const parsed = parseGzTime(gztime);
+  let dateStr = parsed?.date;
+  let timeStr = parsed?.time;
+
+  if (!dateStr || !timeStr) {
+    const now = new Date();
+    dateStr = now.toISOString().slice(0, 10);
+    timeStr = now.toTimeString().slice(0, 5);
+  }
+
+  if (!isTradingTime(timeStr)) return;
+
+  const key = `${TREND_KEY_PREFIX}${code}`;
+  let data;
+  try {
+    data = JSON.parse(localStorage.getItem(key) || '{}');
+  } catch {
+    data = {};
+  }
+
+  if (!data || data.date !== dateStr || !Array.isArray(data.points)) {
+    data = { date: dateStr, points: [] };
+  }
+
+  const points = data.points;
+  const last = points[points.length - 1];
+  if (last && last.time === timeStr) {
+    last.pct = pctNum;
+  } else {
+    points.push({ time: timeStr, pct: pctNum });
+  }
+
+  if (points.length > TREND_MAX_POINTS) {
+    data.points = points.slice(points.length - TREND_MAX_POINTS);
+  }
+
+  localStorage.setItem(key, JSON.stringify(data));
+}
+
+function getFundPctValue(fund) {
+  if (!fund) return null;
+  if (fund.estPricedCoverage > 0.05 && Number.isFinite(fund.estGszzl)) {
+    return fund.estGszzl;
+  }
+  const raw = typeof fund.gszzl === 'number' ? fund.gszzl : Number(fund.gszzl);
+  return Number.isFinite(raw) ? raw : null;
+}
+
+function mergeDefaultLists(saved) {
+  const map = new Map();
+  DEFAULT_LISTS.forEach((item) => map.set(item.id, item));
+  if (Array.isArray(saved)) {
+    saved.forEach((item) => {
+      if (!item || !item.id || !item.name) return;
+      map.set(item.id, { id: item.id, name: item.name });
+    });
+  }
+  return Array.from(map.values());
+}
+
+function sanitizeListName(name) {
+  return name.replace(/\s+/g, ' ').trim();
+}
+
 export default function HomePage() {
   const [funds, setFunds] = useState([]);
   const [code, setCode] = useState('');
@@ -115,9 +224,16 @@ export default function HomePage() {
   // 收起/展开状态
   const [collapsedCodes, setCollapsedCodes] = useState(new Set());
 
-  // 自选状态
-  const [favorites, setFavorites] = useState(new Set());
-  const [currentTab, setCurrentTab] = useState('all');
+  // 列表与持仓状态
+  const [lists, setLists] = useState(DEFAULT_LISTS);
+  const [activeListId, setActiveListId] = useState('all');
+  const [fundListMap, setFundListMap] = useState({});
+  const [listModalOpen, setListModalOpen] = useState(false);
+  const [listModalCode, setListModalCode] = useState('');
+  const [listModalSelected, setListModalSelected] = useState(new Set());
+  const [listModalHoldingAmount, setListModalHoldingAmount] = useState('');
+  const [listModalNewName, setListModalNewName] = useState('');
+  const [listModalError, setListModalError] = useState('');
 
   // 排序状态
   const [sortBy, setSortBy] = useState('default'); // default, name, yield, code
@@ -125,18 +241,101 @@ export default function HomePage() {
   // 视图模式
   const [viewMode, setViewMode] = useState('card'); // card, list
 
-  const toggleFavorite = (code) => {
-    setFavorites(prev => {
+  const persistLists = (nextLists) => {
+    setLists(nextLists);
+    localStorage.setItem(LISTS_KEY, JSON.stringify(nextLists));
+  };
+
+  const persistFundListMap = (nextMap) => {
+    setFundListMap(nextMap);
+    localStorage.setItem(LIST_MAP_KEY, JSON.stringify(nextMap));
+  };
+
+  const isInList = (code, listId) => {
+    const entry = fundListMap?.[code];
+    return Array.isArray(entry?.lists) && entry.lists.includes(listId);
+  };
+
+  const getHoldingAmount = (code) => {
+    const entry = fundListMap?.[code];
+    const val = entry?.holdingAmount;
+    const num = typeof val === 'number' ? val : Number(val);
+    return Number.isFinite(num) ? num : null;
+  };
+
+  const openListModal = (code) => {
+    const entry = fundListMap?.[code];
+    const current = Array.isArray(entry?.lists) ? entry.lists : [];
+    setListModalSelected(new Set(current));
+    setListModalHoldingAmount(entry?.holdingAmount ? String(entry.holdingAmount) : '');
+    setListModalCode(code);
+    setListModalError('');
+    setListModalOpen(true);
+  };
+
+  const closeListModal = () => {
+    setListModalOpen(false);
+    setListModalCode('');
+    setListModalSelected(new Set());
+    setListModalHoldingAmount('');
+    setListModalNewName('');
+    setListModalError('');
+  };
+
+  const toggleListSelection = (listId) => {
+    setListModalSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(code)) {
-        next.delete(code);
+      if (next.has(listId)) {
+        next.delete(listId);
       } else {
-        next.add(code);
+        next.add(listId);
       }
-      localStorage.setItem('favorites', JSON.stringify(Array.from(next)));
-      if (next.size === 0) setCurrentTab('all');
       return next;
     });
+  };
+
+  const createList = () => {
+    const name = sanitizeListName(listModalNewName);
+    if (!name) {
+      setListModalError('请输入列表名称');
+      return;
+    }
+    if (lists.some((l) => l.name === name)) {
+      setListModalError('列表名称已存在');
+      return;
+    }
+    const id = `list_${Date.now()}`;
+    const nextLists = [...lists, { id, name }];
+    persistLists(nextLists);
+    setListModalNewName('');
+    setListModalError('');
+  };
+
+  const saveListSelection = () => {
+    if (!listModalCode) return;
+    const selected = Array.from(listModalSelected);
+    if (selected.includes('holding')) {
+      const amountNum = Number(listModalHoldingAmount);
+      if (!Number.isFinite(amountNum) || amountNum <= 0) {
+        setListModalError('请填写持仓金额');
+        return;
+      }
+    }
+
+    const nextMap = { ...fundListMap };
+    if (selected.length === 0) {
+      delete nextMap[listModalCode];
+      persistFundListMap(nextMap);
+      closeListModal();
+      return;
+    }
+    const nextEntry = { lists: selected };
+    if (selected.includes('holding')) {
+      nextEntry.holdingAmount = Number(listModalHoldingAmount);
+    }
+    nextMap[listModalCode] = nextEntry;
+    persistFundListMap(nextMap);
+    closeListModal();
   };
 
   const toggleCollapse = (code) => {
@@ -184,11 +383,31 @@ export default function HomePage() {
       if (Array.isArray(savedCollapsed)) {
         setCollapsedCodes(new Set(savedCollapsed));
       }
-      // 加载自选状态
-      const savedFavorites = JSON.parse(localStorage.getItem('favorites') || '[]');
-      if (Array.isArray(savedFavorites)) {
-        setFavorites(new Set(savedFavorites));
+      // 加载列表与持仓
+      const savedLists = JSON.parse(localStorage.getItem(LISTS_KEY) || '[]');
+      const nextLists = mergeDefaultLists(savedLists);
+      setLists(nextLists);
+      localStorage.setItem(LISTS_KEY, JSON.stringify(nextLists));
+
+      let nextMap = {};
+      try {
+        nextMap = JSON.parse(localStorage.getItem(LIST_MAP_KEY) || '{}') || {};
+      } catch {
+        nextMap = {};
       }
+
+      // 迁移旧的自选数据到列表
+      const savedFavorites = JSON.parse(localStorage.getItem('favorites') || '[]');
+      if (Array.isArray(savedFavorites) && savedFavorites.length) {
+        savedFavorites.forEach((code) => {
+          if (!code) return;
+          const entry = nextMap[code] || { lists: [] };
+          if (!entry.lists.includes('watch')) entry.lists.push('watch');
+          nextMap[code] = entry;
+        });
+      }
+      setFundListMap(nextMap);
+      localStorage.setItem(LIST_MAP_KEY, JSON.stringify(nextMap));
       // 加载视图模式
       const savedViewMode = localStorage.getItem('viewMode');
       if (savedViewMode === 'card' || savedViewMode === 'list') {
@@ -262,6 +481,12 @@ export default function HomePage() {
           gztime: json.gztime,
           gszzl: Number.isFinite(gszzlNum) ? gszzlNum : json.gszzl
         };
+
+        try {
+          saveTrendPoint(c, gzData.gszzl, gzData.gztime);
+        } catch (e) {
+          console.error('保存分时曲线失败', e);
+        }
 
         // 获取重仓股票列表
         const holdingsUrl = `https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code=${c}&topline=10&year=&month=&rt=${Date.now()}`;
@@ -413,14 +638,13 @@ export default function HomePage() {
       return nextSet;
     });
 
-    // 同步删除自选状态
-    setFavorites(prev => {
-      if (!prev.has(removeCode)) return prev;
-      const nextSet = new Set(prev);
-      nextSet.delete(removeCode);
-      localStorage.setItem('favorites', JSON.stringify(Array.from(nextSet)));
-      if (nextSet.size === 0) setCurrentTab('all');
-      return nextSet;
+    // 同步删除列表与持仓状态
+    setFundListMap(prev => {
+      if (!prev?.[removeCode]) return prev;
+      const nextMap = { ...prev };
+      delete nextMap[removeCode];
+      localStorage.setItem(LIST_MAP_KEY, JSON.stringify(nextMap));
+      return nextMap;
     });
   };
 
@@ -429,6 +653,18 @@ export default function HomePage() {
     const codes = Array.from(new Set(funds.map((f) => f.code)));
     if (!codes.length) return;
     await refreshAll(codes);
+  };
+
+  const formatMoney = (value) => {
+    if (!Number.isFinite(value)) return '--';
+    return `¥${value.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  };
+
+  const getHoldingInfo = (fund) => {
+    const amount = getHoldingAmount(fund.code);
+    const pct = getFundPctValue(fund);
+    const pnl = Number.isFinite(amount) && Number.isFinite(pct) ? amount * (pct / 100) : null;
+    return { amount, pnl };
   };
 
   const saveSettings = (e) => {
@@ -441,15 +677,18 @@ export default function HomePage() {
 
   useEffect(() => {
     const onKey = (ev) => {
-      if (ev.key === 'Escape' && settingsOpen) setSettingsOpen(false);
+      if (ev.key !== 'Escape') return;
+      if (settingsOpen) setSettingsOpen(false);
+      if (listModalOpen) closeListModal();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [settingsOpen]);
+  }, [settingsOpen, listModalOpen]);
+
+  const listModalFund = listModalCode ? funds.find((f) => f.code === listModalCode) : null;
 
   return (
     <div className="container content">
-      <Announcement />
       <div className="navbar glass">
         {refreshing && <div className="loading-bar"></div>}
         <div className="brand">
@@ -510,22 +749,26 @@ export default function HomePage() {
         <div className="col-12">
           {funds.length > 0 && (
             <div className="filter-bar" style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
-              {favorites.size > 0 ? (
-                <div className="tabs">
-                  <button
-                    className={`tab ${currentTab === 'all' ? 'active' : ''}`}
-                    onClick={() => setCurrentTab('all')}
-                  >
-                    全部 ({funds.length})
-                  </button>
-                  <button
-                    className={`tab ${currentTab === 'fav' ? 'active' : ''}`}
-                    onClick={() => setCurrentTab('fav')}
-                  >
-                    自选 ({favorites.size})
-                  </button>
-                </div>
-              ) : <div />}
+              <div className="tabs">
+                <button
+                  className={`tab ${activeListId === 'all' ? 'active' : ''}`}
+                  onClick={() => setActiveListId('all')}
+                >
+                  全部 ({funds.length})
+                </button>
+                {lists.map((list) => {
+                  const count = funds.filter((f) => isInList(f.code, list.id)).length;
+                  return (
+                    <button
+                      key={list.id}
+                      className={`tab ${activeListId === list.id ? 'active' : ''}`}
+                      onClick={() => setActiveListId(list.id)}
+                    >
+                      {list.name} ({count})
+                    </button>
+                  );
+                })}
+              </div>
 
               <div className="sort-group" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                 <div className="view-toggle" style={{ display: 'flex', background: 'rgba(255,255,255,0.05)', borderRadius: '10px', padding: '2px' }}>
@@ -591,7 +834,7 @@ export default function HomePage() {
                 <div className={viewMode === 'card' ? 'grid col-12' : ''} style={viewMode === 'card' ? { gridColumn: 'span 12', gap: 16 } : {}}>
                   <AnimatePresence mode="popLayout">
                     {funds
-                      .filter(f => currentTab === 'all' || favorites.has(f.code))
+                      .filter(f => activeListId === 'all' || isInList(f.code, activeListId))
                       .sort((a, b) => {
                         if (sortBy === 'yield') {
                           const valA = typeof a.estGszzl === 'number' ? a.estGszzl : (Number(a.gszzl) || 0);
@@ -602,7 +845,11 @@ export default function HomePage() {
                         if (sortBy === 'code') return a.code.localeCompare(b.code);
                         return 0; // default order is the order in the array
                       })
-                      .map((f) => (
+                      .map((f) => {
+                        const holdingInfo = getHoldingInfo(f);
+                        const inHolding = isInList(f.code, 'holding');
+                        const showHolding = activeListId === 'holding' && inHolding;
+                        return (
                       <motion.div
                         layout="position"
                         key={f.code}
@@ -617,18 +864,36 @@ export default function HomePage() {
                           <>
                             <div className="table-cell name-cell">
                               <button
-                                className={`icon-button fav-button ${favorites.has(f.code) ? 'active' : ''}`}
+                                className={`icon-button fav-button ${isInList(f.code, 'watch') ? 'active' : ''}`}
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  toggleFavorite(f.code);
+                                  openListModal(f.code);
                                 }}
-                                title={favorites.has(f.code) ? "取消自选" : "添加自选"}
+                                title="加入列表"
                               >
-                                <StarIcon width="18" height="18" filled={favorites.has(f.code)} />
+                                <StarIcon width="18" height="18" filled={isInList(f.code, 'watch')} />
                               </button>
                               <div className="title-text">
                                 <span className="name-text">{f.name}</span>
                                 <span className="muted code-text">#{f.code}</span>
+                                {showHolding && (
+                                  <div className="holding-inline">
+                                    <span>持仓 {formatMoney(holdingInfo.amount)}</span>
+                                    <span className={Number.isFinite(holdingInfo.pnl) ? (holdingInfo.pnl >= 0 ? 'up' : 'down') : 'muted'}>
+                                      收益 {formatMoney(holdingInfo.pnl)}
+                                    </span>
+                                    <button
+                                      className="link-button"
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        openListModal(f.code);
+                                      }}
+                                    >
+                                      修改金额
+                                    </button>
+                                  </div>
+                                )}
                               </div>
                             </div>
                             <div className="table-cell text-right value-cell">
@@ -658,14 +923,14 @@ export default function HomePage() {
                           <div className="row" style={{ marginBottom: 10 }}>
                             <div className="title">
                               <button
-                                className={`icon-button fav-button ${favorites.has(f.code) ? 'active' : ''}`}
+                                className={`icon-button fav-button ${isInList(f.code, 'watch') ? 'active' : ''}`}
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  toggleFavorite(f.code);
+                                  openListModal(f.code);
                                 }}
-                                title={favorites.has(f.code) ? "取消自选" : "添加自选"}
+                                title="加入列表"
                               >
-                                <StarIcon width="18" height="18" filled={favorites.has(f.code)} />
+                                <StarIcon width="18" height="18" filled={isInList(f.code, 'watch')} />
                               </button>
                               <div className="title-text">
                                 <span>{f.name}</span>
@@ -702,6 +967,35 @@ export default function HomePage() {
                               基于 {Math.round(f.estPricedCoverage * 100)}% 持仓估算
                             </div>
                           )}
+                          {showHolding && (
+                            <div className="holding-row">
+                              <div className="holding-item">
+                                <span className="muted">持仓金额</span>
+                                <strong>{formatMoney(holdingInfo.amount)}</strong>
+                              </div>
+                              <div className="holding-item">
+                                <span className="muted">当日收益</span>
+                                <strong className={Number.isFinite(holdingInfo.pnl) ? (holdingInfo.pnl >= 0 ? 'up' : 'down') : 'muted'}>
+                                  {formatMoney(holdingInfo.pnl)}
+                                </strong>
+                              </div>
+                              <button
+                                className="chip mini"
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openListModal(f.code);
+                                }}
+                              >
+                                修改金额
+                              </button>
+                            </div>
+                          )}
+                          <FundChart
+                            fundCode={f.code}
+                            latestTime={f.gztime || f.time || ''}
+                            latestPct={getFundPctValue(f)}
+                          />
                           <div
                             style={{ marginBottom: 8, cursor: 'pointer', userSelect: 'none' }}
                             className="title"
@@ -758,7 +1052,8 @@ export default function HomePage() {
                       )}
                       </div>
                     </motion.div>
-                  ))}
+                    );
+                  })}
                 </AnimatePresence>
                 </div>
               </motion.div>
@@ -771,6 +1066,69 @@ export default function HomePage() {
         <p>数据源：实时估值与重仓直连东方财富，无需后端，部署即用</p>
         <p>注：估算数据与真实结算数据会有1%左右误差</p>
       </div>
+
+      {listModalOpen && (
+        <div className="modal-overlay" role="dialog" aria-modal="true" aria-label="加入列表" onClick={closeListModal}>
+          <div className="glass card modal" onClick={(e) => e.stopPropagation()}>
+            <div className="title" style={{ marginBottom: 12 }}>
+              <StarIcon width="20" height="20" filled />
+              <span>加入列表</span>
+              <span className="muted">{listModalFund ? `${listModalFund.name} #${listModalFund.code}` : ''}</span>
+            </div>
+
+            <div className="list-options">
+              {lists.map((list) => (
+                <label key={list.id} className="list-option">
+                  <input
+                    type="checkbox"
+                    checked={listModalSelected.has(list.id)}
+                    onChange={() => toggleListSelection(list.id)}
+                  />
+                  <span>{list.name}</span>
+                </label>
+              ))}
+            </div>
+
+            {listModalSelected.has('holding') && (
+              <div className="form-group" style={{ marginTop: 12 }}>
+                <div className="muted" style={{ marginBottom: 8, fontSize: '0.8rem' }}>持仓金额（必填）</div>
+                <input
+                  className="input"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={listModalHoldingAmount}
+                  onChange={(e) => setListModalHoldingAmount(e.target.value)}
+                  placeholder="请输入持仓金额"
+                />
+              </div>
+            )}
+
+            <div className="form-group" style={{ marginTop: 12 }}>
+              <div className="muted" style={{ marginBottom: 8, fontSize: '0.8rem' }}>新建列表</div>
+              <div className="row" style={{ gap: 8 }}>
+                <input
+                  className="input"
+                  value={listModalNewName}
+                  onChange={(e) => setListModalNewName(e.target.value)}
+                  placeholder="例如：长线 / 观察"
+                />
+                <button className="button button-secondary" type="button" onClick={createList}>
+                  创建
+                </button>
+              </div>
+            </div>
+
+            {listModalError && (
+              <div className="muted" style={{ marginTop: 10, color: 'var(--danger)' }}>{listModalError}</div>
+            )}
+
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: 20 }}>
+              <button className="button" onClick={saveListSelection}>保存</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {settingsOpen && (
         <div className="modal-overlay" role="dialog" aria-modal="true" aria-label="设置" onClick={() => setSettingsOpen(false)}>
